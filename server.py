@@ -9,6 +9,7 @@ Route handlers are organized in the routes/ folder by domain.
 """
 import logging
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 # Load .env file before any other imports
 from dotenv import load_dotenv
@@ -34,6 +35,7 @@ from backend.routes import (
     frontend_config_router
 )
 from backend.services.raster_service import titiler_app
+from backend.services.startup import check_startup
 
 # Configure app-level logging
 logging.basicConfig(
@@ -42,11 +44,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await check_startup()
+    yield
+
+
 # Create FastAPI app
 app = FastAPI(
     title="GeoFaham",
     description="Geospatial AI Agent Platform",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # Add CORS middleware
