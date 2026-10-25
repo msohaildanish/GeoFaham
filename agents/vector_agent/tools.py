@@ -12,6 +12,8 @@ import json
 import os
 import re
 import datetime
+import asyncio
+import threading
 from contextlib import contextmanager
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -74,6 +76,7 @@ def _create_connection_pool() -> pool.SimpleConnectionPool:
         host=config.database.host,
         port=config.database.port,
         database=config.database.database,
+        connect_timeout=10,
     )
 
 
@@ -527,6 +530,7 @@ class VectorQueryExecutor:
     def __init__(self):
         self._pool = _create_connection_pool()
         self._conn = None
+        self._query_lock = asyncio.Lock()
     
     @contextmanager
     def _get_connection(self):
@@ -671,6 +675,18 @@ class VectorQueryExecutor:
         results_description: str,
         return_aggregated_data: bool = False,
     ) -> str:
+        # A tool retry/parallel call must not reuse a still-running connection.
+        async with self._query_lock:
+            return await self._execute_query_locked(
+                query, return_layer, results_description, return_aggregated_data)
+
+    async def _execute_query_locked(
+        self,
+        query: str,
+        return_layer: bool,
+        results_description: str,
+        return_aggregated_data: bool = False,
+    ) -> str:
         """
         Internal query execution - assumes safety already verified.
         
@@ -678,12 +694,34 @@ class VectorQueryExecutor:
         """
         response_id = generate_response_id()
         conn = self._get_or_create_connection()
-        
-        # Execute query
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        cancelled = threading.Event()
+
+        def run_query():
+            # End the read transaction before returning this connection for reuse.
+            conn.rollback()
+            with conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
+                cur.execute("SET LOCAL statement_timeout = %s",
+                            (get_config().query.sql_timeout_seconds * 1000,))
+                if cancelled.is_set():
+                    return []
                 cur.execute(query)
-                rows = [dict(r) for r in cur.fetchall()]
+                return [dict(r) for r in cur.fetchall()]
+
+        worker = asyncio.create_task(asyncio.to_thread(run_query))
+        try:
+            rows = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled.set()
+            # Wait for cancellation to finish before this connection can be reused.
+            while not worker.done():
+                await asyncio.to_thread(conn.cancel)
+                await asyncio.wait({worker}, timeout=0.05)
+            try:
+                worker.result()
+            except Exception:
+                pass
+            raise
         except psycopg2.Error as e:
             conn.rollback()
             logger.error(f"Database error: {e}", extra={"query": query[:200]})
@@ -852,7 +890,12 @@ class VectorQueryExecutor:
                 # Build feature from geometry column
                 geom = row.get(geom_col) if geom_col else row.get("geom") or row.get("geometry")
                 if geom is None:
-                    continue
+                    return self._error_response(
+                        response_id,
+                        "Layer query contains a row without geometry. Filter missing geometries "
+                        "out of the feature layer and return summary totals in separate queries; "
+                        "use return_layer=False for totals with explicit unit names such as total_length_km.",
+                    )
                 
                 # Validate geometry format and size
                 try:
@@ -899,6 +942,7 @@ class VectorQueryExecutor:
                 stats=artifact.stats,
                 property_keys=artifact.property_keys,
                 geom_types=artifact.geom_types,
+                artifact_metadata=artifact.metadata,
                 data=truncated_rows,
             )
         else:
@@ -911,6 +955,7 @@ class VectorQueryExecutor:
                 stats=artifact.stats,
                 property_keys=artifact.property_keys,
                 geom_types=artifact.geom_types,
+                artifact_metadata=artifact.metadata,
             )
     
     def _build_data_response(
@@ -1051,6 +1096,7 @@ class VectorQueryExecutor:
             stats=artifact.stats,
             property_keys=artifact.property_keys,
             geom_types=artifact.geom_types,
+            artifact_metadata=artifact.metadata,
         )
     
     def _convert_to_meters(self, distance: float, unit: str) -> float:
